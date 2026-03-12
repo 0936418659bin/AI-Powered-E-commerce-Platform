@@ -30,7 +30,12 @@ class VectorService:
                 raise
 
             api_key = current_app.config.get("PINECONE_API_KEY")
+            # allow alternate env var names and capture which one was used
             index_name = current_app.config.get("PINECONE_INDEX_NAME")
+            index_env_source = "PINECONE_INDEX_NAME"
+            if not index_name:
+                index_name = current_app.config.get("PINECONE_INDEX")
+                index_env_source = "PINECONE_INDEX"
 
             if not api_key or not index_name:
                 logger.warning(
@@ -40,20 +45,95 @@ class VectorService:
                 self.initialized = True
                 return
 
-            # Lazy import pinecone and initialize index
+            # Lazy import pinecone and initialize index. Try multiple client APIs (robust detection).
             try:
                 import pinecone
 
-                pinecone.init(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
-                self.index = pinecone.Index(index_name)
+                index_obj = None
+                tried_clients = []
+
+                # Try several possible client class names exposed by different pinecone versions
+                for cls_name in ("Pinecone", "PineconeClient", "Client"):
+                    ClientCls = getattr(pinecone, cls_name, None)
+                    if ClientCls:
+                        tried_clients.append(cls_name)
+                        try:
+                            pc = ClientCls(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
+                            # many clients expose Index() factory
+                            index_obj = getattr(pc, "Index")(index_name)
+                            logger.info("Initialized Pinecone using client class '%s'", cls_name)
+                            break
+                        except Exception as ex_client:
+                            logger.debug("Client class '%s' present but failed to init: %s", cls_name, ex_client)
+
+                # If not created yet, try importing Pinecone directly (some installs use from pinecone import Pinecone)
+                if index_obj is None:
+                    try:
+                        from pinecone import Pinecone as PineconeFromModule  # type: ignore
+
+                        tried_clients.append("pinecone.Pinecone")
+                        pc = PineconeFromModule(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
+                        index_obj = getattr(pc, "Index")(index_name)
+                        logger.info("Initialized Pinecone using 'from pinecone import Pinecone'")
+                    except Exception as ex_mod:
+                        logger.debug("from pinecone import Pinecone failed: %s", ex_mod)
+
+                # Fallback to legacy pinecone.init() if available
+                if index_obj is None:
+                    init_fn = getattr(pinecone, "init", None)
+                    if callable(init_fn):
+                        tried_clients.append("pinecone.init")
+                        try:
+                            pinecone.init(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
+                            index_obj = pinecone.Index(index_name)
+                            logger.info("Initialized Pinecone using legacy pinecone.init()")
+                        except Exception as ex_init:
+                            logger.debug("pinecone.init() failed: %s", ex_init)
+
+                if index_obj is None:
+                    logger.error(
+                        "Failed to initialize Pinecone index '%s' with any known client. Tried: %s",
+                        index_name,
+                        ",".join(tried_clients) or "(none)",
+                    )
+                    self.index = None
+                else:
+                    # Adapter to provide a stable interface expected by the rest of the code
+                    class _IndexAdapter:
+                        def __init__(self, idx):
+                            self._idx = idx
+
+                        def upsert(self, items):
+                            try:
+                                return self._idx.upsert(vectors=items)
+                            except TypeError:
+                                return self._idx.upsert(items)
+
+                        def query(self, **kwargs):
+                            try:
+                                return self._idx.query(**kwargs)
+                            except TypeError:
+                                return self._idx.query(kwargs.get("vector"), kwargs.get("top_k"))
+
+                        def delete(self, ids=None):
+                            return self._idx.delete(ids=ids)
+
+                        def describe_index_stats(self):
+                            return self._idx.describe_index_stats()
+
+                    self.index = _IndexAdapter(index_obj)
             except Exception as pe:
                 logger.error(f"Failed to initialize Pinecone index '{index_name}': {pe}")
                 # keep model loaded but do not raise to avoid crashing app on startup
                 self.index = None
 
             self.initialized = True
-            logger.info("Vector service initialized (model loaded, Pinecone index %s)",
-                        "available" if self.index else "unavailable")
+            logger.info(
+                "Vector service initialized (model loaded, Pinecone index=%s, source=%s, available=%s)",
+                index_name,
+                index_env_source,
+                "yes" if self.index else "no",
+            )
 
         except Exception as e:
             logger.error(f"Failed to initialize vector service: {str(e)}")

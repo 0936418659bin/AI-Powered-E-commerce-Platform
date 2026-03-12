@@ -22,7 +22,12 @@ class Config:
 
     PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
     PINECONE_ENVIRONMENT = os.environ.get("PINECONE_ENVIRONMENT")
-    PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "ecommerce-products")
+    # Support either PINECONE_INDEX_NAME or older PINECONE_INDEX env var. Default to 'ecommerce-chatbot'.
+    PINECONE_INDEX_NAME = (
+        os.environ.get("PINECONE_INDEX_NAME")
+        or os.environ.get("PINECONE_INDEX")
+        or "ecommerce-chatbot"
+    )
 
     FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 

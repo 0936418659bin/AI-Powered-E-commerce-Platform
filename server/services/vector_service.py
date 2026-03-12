@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from flask import current_app
 from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone
 
 logger = logging.getLogger(__name__)
 
@@ -16,128 +17,84 @@ class VectorService:
         self.initialized = False
 
     def initialize(self):
-        """Initialize Pinecone and embedding model. If Pinecone API key is missing,
-        load only the embedding model and operate in local-only mode.
-        """
+        """Initialize embedding model and Pinecone"""
         try:
-            model_name = current_app.config.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+            model_name = current_app.config.get(
+                "EMBEDDING_MODEL", "all-MiniLM-L6-v2"
+            )
 
-            # Load embedding model first (works without Pinecone)
-            try:
-                self.model = SentenceTransformer(model_name)
-            except Exception as me:
-                logger.error(f"Failed to load embedding model '{model_name}': {me}")
-                raise
+            # Load embedding model
+            self.model = SentenceTransformer(model_name)
 
             api_key = current_app.config.get("PINECONE_API_KEY")
-            # allow alternate env var names and capture which one was used
             index_name = current_app.config.get("PINECONE_INDEX_NAME")
-            index_env_source = "PINECONE_INDEX_NAME"
-            if not index_name:
-                index_name = current_app.config.get("PINECONE_INDEX")
-                index_env_source = "PINECONE_INDEX"
 
             if not api_key or not index_name:
                 logger.warning(
-                    "PINECONE_API_KEY or PINECONE_INDEX_NAME not set; vector service running without Pinecone index"
+                    "PINECONE_API_KEY or PINECONE_INDEX_NAME missing -> Pinecone disabled"
                 )
                 self.index = None
                 self.initialized = True
                 return
 
-            # Lazy import pinecone and initialize index. Try multiple client APIs (robust detection).
+            # Initialize Pinecone client (NEW API)
+            pc = Pinecone(api_key=api_key)
+
+            # Check if index exists (be defensive and log available indexes)
             try:
-                import pinecone
+                index_list = pc.list_indexes()
+                indexes = (
+                    index_list.names()
+                    if hasattr(index_list, "names")
+                    else list(index_list)
+                )
+            except Exception as e:
+                logger.error(f"Failed to list Pinecone indexes: {e}")
+                indexes = []
 
-                index_obj = None
-                tried_clients = []
+            logger.info(f"Resolved Pinecone index name from config: '{index_name}'")
+            logger.info(f"Pinecone indexes available: {indexes}")
 
-                # Try several possible client class names exposed by different pinecone versions
-                for cls_name in ("Pinecone", "PineconeClient", "Client"):
-                    ClientCls = getattr(pinecone, cls_name, None)
-                    if ClientCls:
-                        tried_clients.append(cls_name)
-                        try:
-                            pc = ClientCls(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
-                            # many clients expose Index() factory
-                            index_obj = getattr(pc, "Index")(index_name)
-                            logger.info("Initialized Pinecone using client class '%s'", cls_name)
-                            break
-                        except Exception as ex_client:
-                            logger.debug("Client class '%s' present but failed to init: %s", cls_name, ex_client)
-
-                # If not created yet, try importing Pinecone directly (some installs use from pinecone import Pinecone)
-                if index_obj is None:
-                    try:
-                        from pinecone import Pinecone as PineconeFromModule  # type: ignore
-
-                        tried_clients.append("pinecone.Pinecone")
-                        pc = PineconeFromModule(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
-                        index_obj = getattr(pc, "Index")(index_name)
-                        logger.info("Initialized Pinecone using 'from pinecone import Pinecone'")
-                    except Exception as ex_mod:
-                        logger.debug("from pinecone import Pinecone failed: %s", ex_mod)
-
-                # Fallback to legacy pinecone.init() if available
-                if index_obj is None:
-                    init_fn = getattr(pinecone, "init", None)
-                    if callable(init_fn):
-                        tried_clients.append("pinecone.init")
-                        try:
-                            pinecone.init(api_key=api_key, environment=current_app.config.get("PINECONE_ENVIRONMENT"))
-                            index_obj = pinecone.Index(index_name)
-                            logger.info("Initialized Pinecone using legacy pinecone.init()")
-                        except Exception as ex_init:
-                            logger.debug("pinecone.init() failed: %s", ex_init)
-
-                if index_obj is None:
-                    logger.error(
-                        "Failed to initialize Pinecone index '%s' with any known client. Tried: %s",
-                        index_name,
-                        ",".join(tried_clients) or "(none)",
+            chosen_index = None
+            if index_name in indexes:
+                chosen_index = index_name
+            else:
+                # try to find a close match (contains / startswith)
+                candidates = [i for i in indexes if index_name.lower() in i.lower() or i.lower().startswith(index_name.lower())]
+                if candidates:
+                    chosen_index = candidates[0]
+                    logger.warning(
+                        f"Pinecone index '{index_name}' not found; falling back to similar index '{chosen_index}'"
                     )
-                    self.index = None
+                elif indexes:
+                    chosen_index = indexes[0]
+                    logger.warning(
+                        f"Pinecone index '{index_name}' not found; falling back to first available index '{chosen_index}'"
+                    )
                 else:
-                    # Adapter to provide a stable interface expected by the rest of the code
-                    class _IndexAdapter:
-                        def __init__(self, idx):
-                            self._idx = idx
+                    logger.error(f"Pinecone index '{index_name}' does not exist and no indexes available")
 
-                        def upsert(self, items):
-                            try:
-                                return self._idx.upsert(vectors=items)
-                            except TypeError:
-                                return self._idx.upsert(items)
-
-                        def query(self, **kwargs):
-                            try:
-                                return self._idx.query(**kwargs)
-                            except TypeError:
-                                return self._idx.query(kwargs.get("vector"), kwargs.get("top_k"))
-
-                        def delete(self, ids=None):
-                            return self._idx.delete(ids=ids)
-
-                        def describe_index_stats(self):
-                            return self._idx.describe_index_stats()
-
-                    self.index = _IndexAdapter(index_obj)
-            except Exception as pe:
-                logger.error(f"Failed to initialize Pinecone index '{index_name}': {pe}")
-                # keep model loaded but do not raise to avoid crashing app on startup
+            if chosen_index:
+                try:
+                    self.index = pc.Index(chosen_index)
+                    logger.info(f"Pinecone connected to index: {chosen_index}")
+                except Exception as e:
+                    logger.error(f"Failed to create index client for '{chosen_index}': {e}")
+                    self.index = None
+            else:
                 self.index = None
 
             self.initialized = True
+
             logger.info(
-                "Vector service initialized (model loaded, Pinecone index=%s, source=%s, available=%s)",
-                index_name,
-                index_env_source,
+                "Vector service initialized (model loaded, Pinecone available=%s)",
                 "yes" if self.index else "no",
             )
 
         except Exception as e:
             logger.error(f"Failed to initialize vector service: {str(e)}")
-            raise
+            self.index = None
+            self.initialized = True
 
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for given text"""
@@ -146,7 +103,12 @@ class VectorService:
 
         try:
             embedding = self.model.encode(text)
-            return embedding.tolist()
+
+            if hasattr(embedding, "tolist"):
+                return embedding.tolist()
+
+            return list(embedding)
+
         except Exception as e:
             logger.error(f"Failed to generate embedding: {str(e)}")
             raise
@@ -159,7 +121,10 @@ class VectorService:
             self.initialize()
 
         if not self.index:
-            logger.warning("Pinecone index not available; skipping upsert for %s", product_id)
+            logger.warning(
+                "Pinecone index not available; skipping upsert for %s",
+                product_id,
+            )
             return
 
         try:
@@ -171,7 +136,8 @@ class VectorService:
                 "metadata": metadata or {},
             }
 
-            self.index.upsert([vector_data])
+            self.index.upsert(vectors=[vector_data])
+
             logger.info(f"Upserted embedding for product: {product_id}")
 
         except Exception as e:
@@ -179,18 +145,26 @@ class VectorService:
             raise
 
     def search_similar_products(
-        self, query_text: str, top_k: int = 10, filter_dict: Dict[str, Any] = None
+        self,
+        query_text: str,
+        top_k: int = 10,
+        filter_dict: Dict[str, Any] = None,
     ) -> List[Dict[str, Any]]:
         """Search for similar products using vector similarity"""
         if not self.initialized:
             self.initialize()
 
+        logger.debug(f"search_similar_products called; initialized={self.initialized}, index_present={bool(self.index)}")
         if not self.index:
-            logger.warning("Pinecone index not available; semantic search disabled")
+            logger.warning(
+                "Pinecone index not available; semantic search disabled"
+            )
             return []
 
         try:
             query_embedding = self.generate_embedding(query_text)
+
+            logger.debug(f"Query embedding length: {len(query_embedding) if query_embedding else 0}")
 
             search_kwargs = {
                 "vector": query_embedding,
@@ -199,24 +173,31 @@ class VectorService:
                 "include_values": False,
             }
 
+            logger.debug(f"Pinecone query kwargs: top_k={top_k}, filter_provided={bool(filter_dict)}")
+
             if filter_dict:
                 search_kwargs["filter"] = filter_dict
 
             results = self.index.query(**search_kwargs)
+            logger.debug(f"Raw pinecone query response: {repr(results)[:1000]}")
 
             similar_products = []
-            for match in results.get("matches", []):
+
+            for match in results.matches:
                 similar_products.append(
                     {
-                        "id": match.get("id"),
-                        "score": match.get("score"),
-                        "metadata": match.get("metadata", {}),
+                        "id": match.id,
+                        "score": match.score,
+                        "metadata": match.metadata or {},
                     }
                 )
+
+            logger.debug(f"Similar products found: {len(similar_products)}")
 
             logger.info(
                 f"Found {len(similar_products)} similar products for query: {query_text}"
             )
+
             return similar_products
 
         except Exception as e:
@@ -229,11 +210,15 @@ class VectorService:
             self.initialize()
 
         if not self.index:
-            logger.warning("Pinecone index not available; skip delete for %s", product_id)
+            logger.warning(
+                "Pinecone index not available; skip delete for %s",
+                product_id,
+            )
             return
 
         try:
             self.index.delete(ids=[product_id])
+
             logger.info(f"Deleted embedding for product: {product_id}")
 
         except Exception as e:
@@ -246,25 +231,32 @@ class VectorService:
             self.initialize()
 
         if not self.index:
-            logger.warning("Pinecone index not available; returning empty stats")
+            logger.warning(
+                "Pinecone index not available; returning empty stats"
+            )
             return {}
 
         try:
             stats = self.index.describe_index_stats()
             return stats
+
         except Exception as e:
             logger.error(f"Failed to get index stats: {str(e)}")
             return {}
 
     def batch_upsert_products(
-        self, products: List[Dict[str, Any]], batch_size: int = 100
+        self,
+        products: List[Dict[str, Any]],
+        batch_size: int = 100,
     ):
         """Batch upsert multiple product embeddings"""
         if not self.initialized:
             self.initialize()
 
         if not self.index:
-            logger.warning("Pinecone index not available; skipping batch upsert")
+            logger.warning(
+                "Pinecone index not available; skipping batch upsert"
+            )
             return
 
         try:
@@ -272,6 +264,7 @@ class VectorService:
 
             for product in products:
                 embedding = self.generate_embedding(product["text"])
+
                 vectors.append(
                     {
                         "id": product["id"],
@@ -281,13 +274,15 @@ class VectorService:
                 )
 
                 if len(vectors) >= batch_size:
-                    self.index.upsert(vectors)
+                    self.index.upsert(vectors=vectors)
                     vectors = []
 
             if vectors:
-                self.index.upsert(vectors)
+                self.index.upsert(vectors=vectors)
 
-            logger.info(f"Batch upserted {len(products)} product embeddings")
+            logger.info(
+                f"Batch upserted {len(products)} product embeddings"
+            )
 
         except Exception as e:
             logger.error(f"Failed to batch upsert products: {str(e)}")

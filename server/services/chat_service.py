@@ -414,10 +414,18 @@ class ChatService:
             if initialize_agent is None or self.llm is None:
                 logger.info("Using fallback chat handler (no langchain agent available)")
 
-                # Try semantic search using vector service
+                # Ensure vector service is initialized / re-check the index before searching
                 try:
+                    if not getattr(self.vector_service, "index", None):
+                        logger.info("Vector index not present, attempting to re-initialize vector service")
+                        try:
+                            self.vector_service.initialize()
+                        except Exception as e_init:
+                            logger.warning(f"Re-initializing vector service failed: {e_init}")
+
                     similar = self.vector_service.search_similar_products(user_message, top_k=6)
                 except Exception:
+                    logger.exception("Error while performing semantic search")
                     similar = []
 
                 if similar:
